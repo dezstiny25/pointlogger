@@ -13,7 +13,7 @@ const { google } = require("googleapis");
 // CONFIG
 // =========================
 
-const EVENT_LOG_CHANNEL_ID = "1495741560464081066";
+const EVENT_LOG_CHANNEL_ID = "1495681621183954975";
 const APPROVER_ROLE_NAME = "Senior Officer Ranking Access";
 
 // =========================
