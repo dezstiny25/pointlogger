@@ -9,12 +9,15 @@ const {
 
 const { google } = require("googleapis");
 
+const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
+
 // =========================
 // CONFIG
 // =========================
 
-const EVENT_LOG_CHANNEL_ID = "1495681621183954975";
+const EVENT_LOG_CHANNEL_ID = "1495741560464081066";
 const APPROVER_ROLE_NAME = "Senior Officer Ranking Access";
+const VC_CHANNEL_ID = "1200735025864388638";
 
 // =========================
 // PENDING APPROVALS
@@ -346,15 +349,20 @@ client.on("messageCreate", async (message) => {
 
     if (entries.length === 0) return;
 
-    const attachmentFiles = [];
+    // =========================
+    // ATTACHMENT / IMAGE
+    // =========================
 
-    // Copy image attachments
+    let embedImage = null;
+
+    // Find first uploaded image
     message.attachments.forEach((attachment) => {
       if (
         attachment.contentType &&
-        attachment.contentType.startsWith("image/")
+        attachment.contentType.startsWith("image/") &&
+        !embedImage
       ) {
-        attachmentFiles.push(attachment.url);
+        embedImage = attachment.url;
       }
     });
 
@@ -362,7 +370,6 @@ client.on("messageCreate", async (message) => {
     // EMBED
     // =========================
 
-    // derive event title from the first non-empty line of the message
     const firstLine =
       (message.content || "").split("\n").find((l) => l.trim().length > 0) ||
       "Event";
@@ -393,14 +400,17 @@ client.on("messageCreate", async (message) => {
       .setColor("Yellow")
       .setTimestamp();
 
+    // Put uploaded image inside embed
+    if (embedImage) {
+      approvalEmbed.setImage(embedImage);
+    }
+
     // =========================
     // SEND APPROVAL MESSAGE
     // =========================
 
     const approvalMessage = await message.reply({
       embeds: [approvalEmbed],
-
-      files: attachmentFiles,
 
       allowedMentions: {
         repliedUser: false,
@@ -414,6 +424,7 @@ client.on("messageCreate", async (message) => {
     pendingApprovals.set(approvalMessage.id, {
       originalMessageId: message.id,
       entries,
+      embedImage,
     });
 
     // =========================
@@ -593,6 +604,9 @@ client.on("messageReactionAdd", async (reaction, user) => {
         )
         .setDescription(reaction.message.embeds[0]?.description || "No content")
         .setTimestamp();
+      if (data.embedImage) {
+        approvedEmbed.setImage(data.embedImage);
+      }
 
       // =========================
       // PROMOTION ALERTS
@@ -1040,9 +1054,6 @@ client.on("messageReactionAdd", async (reaction, user) => {
         embeds: [approvedEmbed],
       });
 
-      // Mark approved
-      await reaction.message.react("☑️");
-
       // Remove pending
       pendingApprovals.delete(messageId);
 
@@ -1070,6 +1081,10 @@ client.on("messageReactionAdd", async (reaction, user) => {
         )
         .setDescription(reaction.message.embeds[0]?.description || "No content")
         .setTimestamp();
+      // Re-add original image
+      if (data.embedImage) {
+        deniedEmbed.setImage(data.embedImage);
+      }
 
       await reaction.message.edit({ embeds: [deniedEmbed] });
 
@@ -1081,6 +1096,105 @@ client.on("messageReactionAdd", async (reaction, user) => {
   } catch (err) {
     console.error(err);
   }
+});
+
+// =========================
+// READY EVENT - JOIN VC
+// =========================
+
+client.on("ready", async () => {
+  console.log(`✅ Bot logged in as ${client.user.tag}`);
+
+  try {
+    // List all guilds the bot has access to
+    console.log(`\n========== BOT GUILD ACCESS ==========`);
+    console.log(`Total guilds: ${client.guilds.cache.size}`);
+    client.guilds.cache.forEach((g) => {
+      console.log(`  - ${g.name} (ID: ${g.id})`);
+    });
+    console.log(`=====================================\n`);
+
+    const guild = client.guilds.cache.first();
+    if (!guild) {
+      console.error("❌ No guilds found!");
+      return;
+    }
+
+    console.log(`🔗 Attempting to connect to: ${guild.name} (ID: ${guild.id})`);
+
+    // Try to find by ID first, then by name
+    let voiceChannel = guild.channels.cache.get(VC_CHANNEL_ID);
+
+    if (!voiceChannel) {
+      console.log(
+        `⚠️ Channel ID ${VC_CHANNEL_ID} not found, searching by name...`,
+      );
+      voiceChannel = guild.channels.cache.find(
+        (ch) => ch.type === 2 && ch.name === "📻 | MAIN-RADIO | 101.1",
+      );
+    }
+
+    if (!voiceChannel) {
+      console.error(`❌ Voice channel not found by ID or name!`);
+      console.log(
+        "Available voice channels:",
+        guild.channels.cache
+          .filter((ch) => ch.type === 2)
+          .map((ch) => `${ch.name} (${ch.id})`)
+          .join(", ") || "None",
+      );
+      return;
+    }
+
+    if (voiceChannel.type !== 2) {
+      // 2 is GUILD_VOICE
+      console.error("❌ Target channel is not a voice channel!");
+      return;
+    }
+
+    joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: voiceChannel.guild.id,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    });
+
+    console.log(`✅ Bot joined voice channel: ${voiceChannel.name}`);
+  } catch (err) {
+    console.error("❌ Error joining voice channel:", err);
+  }
+});
+
+// =========================
+// SHUTDOWN - LEAVE VC
+// =========================
+
+async function leaveVoiceChannel() {
+  try {
+    const guild = client.guilds.cache.first();
+    if (!guild) return;
+
+    const connection = getVoiceConnection(guild.id);
+    if (connection) {
+      connection.destroy();
+      console.log("✅ Bot left voice channel");
+    }
+  } catch (err) {
+    console.error("❌ Error leaving voice channel:", err);
+  }
+}
+
+process.on("SIGTERM", async () => {
+  console.log("📍 SIGTERM received, shutting down gracefully...");
+  await leaveVoiceChannel();
+  client.destroy();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  console.log("📍 SIGINT received, shutting down gracefully...");
+  await leaveVoiceChannel();
+  client.destroy();
+  process.exit(0);
 });
 
 // =========================
