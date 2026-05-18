@@ -86,6 +86,60 @@ const rankHierarchy = [
     nextRoleId: "1172166076688248955",
     nextRoleName: "[OR-4] | Corporal",
   },
+
+  {
+    tag: "OR-4",
+    roleId: "1172166076688248955",
+    roleName: "[OR-4] | Corporal",
+    nextTag: "OR-5",
+    nextRoleId: "1452656341666627585",
+    nextRoleName: "[OR-5] | Corporal First Class",
+  },
+
+  {
+    tag: "OR-5",
+    roleId: "1172166076688248955",
+    roleName: "[OR-5] | Corporal First Class",
+    nextTag: "OR-6",
+    nextRoleId: "1172166189938647172",
+    nextRoleName: "[OR-6] | Sergeant",
+  },
+
+  {
+    tag: "OR-6",
+    roleId: "1172166189938647172",
+    roleName: "[OR-6] | Corporal First Class",
+    nextTag: "OR-7",
+    nextRoleId: "1172166304673828884",
+    nextRoleName: "[OR-7] | Technical Sergeant",
+  },
+
+  {
+    tag: "OR-7",
+    roleId: "1172166304673828884",
+    roleName: "[OR-7] | Technical Sergeant",
+    nextTag: "OR-8",
+    nextRoleId: "1172166486761148487",
+    nextRoleName: "[OR-8] | Master Sergeant",
+  },
+
+  {
+    tag: "OR-8",
+    roleId: "1172166486761148487",
+    roleName: "[OR-8] | Master Sergeant",
+    nextTag: "OR-9",
+    nextRoleId: "1172166656232013957",
+    nextRoleName: "[OR-9] | Senior Master Sergeant",
+  },
+
+  {
+    tag: "OR-9",
+    roleId: "1172166656232013957",
+    roleName: "[OR-9] | Senior Master Sergeant",
+    nextTag: "OR-10",
+    nextRoleId: "1172166785169109062",
+    nextRoleName: "[OR-10] | Chief Master Sergeant",
+  },
 ];
 
 // =========================
@@ -494,8 +548,9 @@ const ENLISTED_RANKS = [
   "[OR-5] | Corporal First Class",
   "[OR-6] | Sergeant",
   "[OR-7] | Technical Sergeant",
-  "[OR-8] | Senior First Sergeant",
-  "[OR-9] | Master Sergeant",
+  "[OR-8] | Master Sergeant",
+  "[OR-9] | Senior Master Sergeant",
+  "[OR-10] | Chief Master Sergeant",
 ];
 
 async function removeRolesByName(
