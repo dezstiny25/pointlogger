@@ -10,10 +10,15 @@ const {
   Routes,
 } = require("discord.js");
 
-const { google } = require("googleapis");
-
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 
+const getMessageLink = require("./lib/getMessageLink");
+const logApproval = require("./lib/logApproval");
+const sheetHelper = require("./lib/updateSheet");
+const parseMerit = require("./lib/parseMerit");
+const removeRolesByName = require("./lib/removeRolesByName");
+const leaveVoiceChannel = require("./lib/leaveVoiceChannel");
+const getPoints = require("./lib/getPoints");
 // =========================
 // CONFIG
 // =========================
@@ -28,6 +33,7 @@ const GUILD_ID = "1172162294470426695";
 // =========================
 
 const pendingApprovals = new Map();
+const processingApprovals = new Set();
 
 // =========================
 // PROMOTION RANKS
@@ -142,6 +148,20 @@ const rankHierarchy = [
   },
 ];
 
+// Human-readable rank -> abbreviation mapping used for sheet sync
+const RANK_ABBREV = {
+  Private: "PVT",
+  "Private First Class": "PFC",
+  "Lance Corporal": "LC",
+  Corporal: "CPL",
+  "Corporal First Class": "CFC",
+  Sergeant: "SGT",
+  "Technical Sergeant": "TSGT",
+  "Master Sergeant": "MSG",
+  "Senior Master Sergeant": "SFC",
+  "Chief Master Sergeant": "CMS",
+};
+
 // =========================
 // DISCORD CLIENT
 // =========================
@@ -159,274 +179,7 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-// =========================
-// GOOGLE SHEETS AUTH
-// =========================
-
-const auth = new google.auth.GoogleAuth({
-  keyFile: "credentials.json",
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-
-// =========================
-// HELPER: MESSAGE LINK
-// =========================
-
-function getMessageLink(message) {
-  return `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`;
-}
-
-// =========================
-// LOG TO LOGS SHEET
-// =========================
-
-async function logApproval(message, approver, timestamp, status) {
-  const sheets = google.sheets({
-    version: "v4",
-    auth: await auth.getClient(),
-  });
-
-  const messageLink = getMessageLink(message);
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.SPREADSHEET_ID,
-
-    range: "Logs!A:D",
-
-    valueInputOption: "RAW",
-
-    requestBody: {
-      values: [[messageLink, approver, timestamp, status]],
-    },
-  });
-}
-
-// =========================
-// UPDATE SHEET
-// =========================
-
-async function updateSheet(callsign, points) {
-  const sheets = google.sheets({
-    version: "v4",
-    auth: await auth.getClient(),
-  });
-
-  const sheetNames = [
-    "1st Infantry Division",
-    "Scout Rangers",
-    "Light Reaction Regiment",
-  ];
-
-  for (let sheetName of sheetNames) {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SPREADSHEET_ID,
-      range: `${sheetName}!B2:D100`,
-    });
-
-    const rows = res.data.values || [];
-
-    for (let i = 0; i < rows.length; i++) {
-      let sheetCallsign = rows[i][0];
-
-      if (
-        sheetCallsign &&
-        sheetCallsign.toLowerCase() === callsign.toLowerCase()
-      ) {
-        let currentPoints = parseInt(rows[i][2]) || 0;
-
-        let newPoints = currentPoints + points;
-
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: process.env.SPREADSHEET_ID,
-
-          range: `${sheetName}!D${i + 2}`,
-
-          valueInputOption: "RAW",
-
-          requestBody: {
-            values: [[newPoints]],
-          },
-        });
-
-        console.log(`${callsign} updated in ${sheetName}`);
-
-        // =========================
-        // PROMOTION ALERT CHECK
-        // =========================
-
-        let promotionAlert = null;
-
-        for (const promo of promotionRanks) {
-          // Exact / eligible
-          if (currentPoints < promo.points && newPoints >= promo.points) {
-            promotionAlert = `${callsign} is now eligible for promotion to ${promo.rank}!`;
-
-            break;
-          }
-
-          // Close to promotion
-          if (promo.points - newPoints <= 50 && promo.points - newPoints > 0) {
-            promotionAlert = `${callsign} is close to promotion to ${promo.rank} (${promo.points - newPoints} points remaining)`;
-
-            break;
-          }
-        }
-
-        return {
-          success: true,
-          promotionAlert,
-        };
-      }
-    }
-  }
-
-  console.log(`❌ Callsign not found: ${callsign}`);
-
-  return {
-    success: false,
-    error: `Callsign "${callsign}" not found`,
-  };
-}
-
-// =========================
-// PARSE MERIT
-// =========================
-
-function parseMerit(message) {
-  if (!message || !message.content) return [];
-
-  const lines = message.content.split("\n");
-
-  let results = [];
-
-  let isAllMode = false;
-  let allPoints = 0;
-
-  // =========================
-  // FIND ATTENDEES SECTION
-  // =========================
-
-  let attendeeLines = [];
-
-  let insideAttendees = false;
-
-  for (const line of lines) {
-    const cleanLine = line.trim().toLowerCase();
-
-    // Detect Attendees section
-    if (cleanLine.includes("attendees")) {
-      insideAttendees = true;
-      continue;
-    }
-
-    // Stop when another section starts
-    if (
-      insideAttendees &&
-      (cleanLine.includes("officer in charge") ||
-        cleanLine.includes("supervising officer") ||
-        cleanLine.includes("instructor") ||
-        cleanLine.includes("hosts") ||
-        cleanLine.includes("remarks"))
-    ) {
-      insideAttendees = false;
-    }
-
-    if (insideAttendees) {
-      attendeeLines.push(line);
-    }
-  }
-
-  // Use ONLY attendee lines
-  const targetLines = attendeeLines.length > 0 ? attendeeLines : lines;
-
-  // =========================
-  // CHECK ALL MODE
-  // =========================
-
-  for (let line of targetLines) {
-    let allMatch = line.match(/All\s*-\s*(\d+)/i);
-
-    if (allMatch) {
-      isAllMode = true;
-      allPoints = parseInt(allMatch[1]);
-      break;
-    }
-  }
-
-  // =========================
-  // ALL MODE
-  // =========================
-
-  if (isAllMode) {
-    for (let line of targetLines) {
-      let mentionMatch = line.match(/<@!?(\d+)>/);
-
-      if (!mentionMatch) continue;
-
-      let userId = mentionMatch[1];
-
-      let member = message.guild.members.cache.get(userId);
-
-      if (!member) continue;
-
-      let nickname = member.nickname || member.user.username;
-
-      let parts = nickname.split("|").map((p) => p.trim());
-
-      if (parts.length < 2) continue;
-
-      let callsign = parts[1];
-
-      results.push({
-        userId: userId,
-        callsign,
-        points: allPoints,
-      });
-    }
-
-    return results;
-  }
-
-  // =========================
-  // INDIVIDUAL MODE
-  // =========================
-
-  for (let line of targetLines) {
-    if (!line.includes("-")) continue;
-
-    let mentionMatch = line.match(/<@!?(\d+)>/);
-
-    if (!mentionMatch) continue;
-
-    let userId = mentionMatch[1];
-
-    let member = message.guild.members.cache.get(userId);
-
-    if (!member) continue;
-
-    let nickname = member.nickname || member.user.username;
-
-    let parts = nickname.split("|").map((p) => p.trim());
-
-    if (parts.length < 2) continue;
-
-    let callsign = parts[1];
-
-    let pointsMatch = line.match(/-\s*(\d+)/);
-
-    if (!pointsMatch) continue;
-
-    let points = parseInt(pointsMatch[1]);
-
-    results.push({
-      userId: userId,
-      callsign,
-      points,
-    });
-  }
-
-  return results;
-}
+// helper functions are extracted into ./lib/*.js
 // =========================
 // EVENT LOG DETECTION
 // =========================
@@ -553,72 +306,7 @@ const ENLISTED_RANKS = [
   "[OR-10] | Chief Master Sergeant",
 ];
 
-async function removeRolesByName(
-  member,
-  roleNames,
-  guild,
-  roleErrors,
-  roleSummaryMap,
-) {
-  const botMember =
-    guild.members.me || (await guild.members.fetch(client.user.id));
-
-  for (const roleName of roleNames) {
-    let role = null;
-
-    if (/^\d+$/.test(String(roleName).trim())) {
-      role = guild.roles.cache.get(String(roleName).trim());
-    } else {
-      role = guild.roles.cache.find(
-        (r) => r.name.trim() === String(roleName).trim(),
-      );
-    }
-
-    if (!role) continue;
-
-    try {
-      // hierarchy check
-      if (role.position >= botMember.roles.highest.position) {
-        roleErrors.push(
-          `❌ Cannot remove "${role.name}" because it is above bot hierarchy.`,
-        );
-
-        continue;
-      }
-
-      if (member.roles.highest.position >= botMember.roles.highest.position) {
-        roleErrors.push(
-          `❌ Cannot modify ${member.user.tag}; member hierarchy higher than bot.`,
-        );
-
-        continue;
-      }
-
-      if (member.roles.cache.has(role.id)) {
-        await member.roles.remove(role);
-
-        const id = member.id;
-        const tag = member.user.tag;
-        const existing = roleSummaryMap.get(id) || {
-          tag,
-          added: [],
-          removed: [],
-          already: [],
-          nicknames: [],
-        };
-
-        existing.removed.push(role.name);
-        roleSummaryMap.set(id, existing);
-      }
-    } catch (err) {
-      roleErrors.push(
-        `❌ Failed removing "${role.name}" from ${member.user.tag}\n` +
-          `Reason: ${err.message}\n` +
-          `Code: ${err.code || "Unknown"}`,
-      );
-    }
-  }
-}
+// Helper `removeRolesByName` extracted to ./lib/removeRolesByName.js
 
 // =========================
 // APPROVAL SYSTEM
@@ -635,6 +323,14 @@ client.on("messageReactionAdd", async (reaction, user) => {
     const messageId = reaction.message.id;
 
     if (!pendingApprovals.has(messageId)) return;
+
+    // prevent duplicate concurrent processing for the same approval message
+    if (processingApprovals.has(messageId)) {
+      console.log(`Ignoring duplicate processing for approval ${messageId}`);
+      return;
+    }
+
+    processingApprovals.add(messageId);
 
     const member = await reaction.message.guild.members.fetch(user.id);
 
@@ -660,14 +356,93 @@ client.on("messageReactionAdd", async (reaction, user) => {
       const promotionAlerts = [];
 
       // =========================
-      // UPDATE ALL ENTRIES
+      // FETCH ORIGINAL MESSAGE TO DETERMINE EVENT TYPE
+      // =========================
+      let originalMsg = null;
+      let eventNormalized = "";
+      let isBMT = false;
+      let isSR = false;
+      let isLRR = false;
+
+      try {
+        originalMsg = await reaction.message.channel.messages.fetch(
+          data.originalMessageId,
+        );
+
+        const firstLine =
+          (originalMsg.content || "")
+            .split("\n")
+            .find((l) => l.trim().length > 0) || "Event";
+        const rawTitle = firstLine.replace(/^#+\s*/, "").trim();
+        eventNormalized = rawTitle.toLowerCase();
+
+        isBMT = /basic military training|\bbmt\b/i.test(eventNormalized);
+        isSR = /sr selection|scout rangers/i.test(eventNormalized);
+        isLRR = /lrr selection|light reaction/i.test(eventNormalized);
+      } catch (err) {
+        console.error(
+          "Failed to fetch original message for event detection:",
+          err,
+        );
+      }
+
+      // =========================
+      // UPDATE ALL ENTRIES (with BMT/SR/LRR handling)
       // =========================
 
       for (const entry of data.entries) {
-        const result = await updateSheet(entry.callsign, entry.points);
+        const result = await sheetHelper.updateSheet(
+          entry.callsign,
+          entry.points,
+          promotionRanks,
+        );
 
         if (!result.success) {
-          errors.push(result.error);
+          // If BMT, add trainee row to "1st Infantry Division"
+          if (isBMT) {
+            try {
+              await sheetHelper.addTrainee(
+                entry.callsign,
+                entry.points,
+                "1st Infantry Division",
+              );
+            } catch (err) {
+              errors.push(
+                `Failed adding trainee ${entry.callsign}: ${err.message}`,
+              );
+            }
+          } else {
+            errors.push(result.error);
+          }
+        } else {
+          // If they were found and this is an SR/LRR selection, transfer the row to the target sheet
+          if (isSR) {
+            try {
+              await sheetHelper.transferToSheet(
+                entry.callsign,
+                "Scout Rangers",
+                promotionRanks,
+              );
+            } catch (err) {
+              errors.push(
+                `Failed transferring ${entry.callsign} to Scout Rangers: ${err.message}`,
+              );
+            }
+          }
+
+          if (isLRR) {
+            try {
+              await sheetHelper.transferToSheet(
+                entry.callsign,
+                "Light Reaction Regiment",
+                promotionRanks,
+              );
+            } catch (err) {
+              errors.push(
+                `Failed transferring ${entry.callsign} to Light Reaction Regiment: ${err.message}`,
+              );
+            }
+          }
         }
 
         if (result.promotionAlert) {
@@ -687,7 +462,19 @@ client.on("messageReactionAdd", async (reaction, user) => {
       // LOG APPROVED
       // =========================
 
-      await logApproval(reaction.message, user.username, timestamp, "Approved");
+      const logRes = await logApproval(
+        reaction.message,
+        user.username,
+        timestamp,
+        "Approved",
+      );
+
+      if (logRes && logRes.alreadyLogged) {
+        console.log(
+          `Approval already logged for ${messageId}, skipping reply.`,
+        );
+        return;
+      }
 
       // =========================
       // APPROVED EMBED
@@ -1220,7 +1007,17 @@ client.on("messageReactionAdd", async (reaction, user) => {
         timeZone: "Asia/Manila",
       });
 
-      await logApproval(reaction.message, user.username, timestamp, "Denied");
+      const logResDenied = await logApproval(
+        reaction.message,
+        user.username,
+        timestamp,
+        "Denied",
+      );
+
+      if (logResDenied && logResDenied.alreadyLogged) {
+        console.log(`Denial already logged for ${messageId}, skipping reply.`);
+        return;
+      }
 
       const deniedEmbed = new EmbedBuilder()
         .setTitle("❌ POINTS DENIED")
@@ -1251,6 +1048,13 @@ client.on("messageReactionAdd", async (reaction, user) => {
     }
   } catch (err) {
     console.error(err);
+  } finally {
+    // ensure guard is cleared so the message can be processed again if needed
+    try {
+      processingApprovals.delete(messageId);
+    } catch (e) {
+      /* ignore */
+    }
   }
 });
 
@@ -1289,49 +1093,45 @@ client.on("ready", async () => {
 
     console.log(`🎙️ Attempting to join VC: ${voiceChannel.name}`);
 
-    joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: guild.id,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
+    try {
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: guild.id,
+        adapterCreator: guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false,
+      });
 
-    console.log(`✅ Successfully joined VC`);
+      // Attach error handler to avoid uncaught errors from the underlying socket
+      connection.on("error", (err) => {
+        console.error("❌ Voice connection error:", err);
+        try {
+          connection.destroy();
+        } catch (e) {
+          console.error("❌ Failed to destroy voice connection:", e);
+        }
+      });
+
+      console.log(`✅ Successfully joined VC`);
+    } catch (err) {
+      console.error("❌ Failed to join VC:", err);
+    }
   } catch (err) {
     console.error("❌ VC JOIN ERROR:", err);
   }
 });
 
-// =========================
-// SHUTDOWN - LEAVE VC
-// =========================
-
-async function leaveVoiceChannel() {
-  try {
-    const guild = client.guilds.cache.first();
-    if (!guild) return;
-
-    const connection = getVoiceConnection(guild.id);
-    if (connection) {
-      connection.destroy();
-      console.log("✅ Bot left voice channel");
-    }
-  } catch (err) {
-    console.error("❌ Error leaving voice channel:", err);
-  }
-}
-
+// Shutdown handling: leave voice channel using extracted helper
 process.on("SIGTERM", async () => {
   console.log("📍 SIGTERM received, shutting down gracefully...");
-  await leaveVoiceChannel();
+  await leaveVoiceChannel(client);
   client.destroy();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   console.log("📍 SIGINT received, shutting down gracefully...");
-  await leaveVoiceChannel();
+  await leaveVoiceChannel(client);
   client.destroy();
   process.exit(0);
 });
@@ -1366,6 +1166,15 @@ client.once("ready", async () => {
             .setDescription("Third user")
             .setRequired(false),
         ),
+      new SlashCommandBuilder()
+        .setName("checkpoints")
+        .setDescription("Check points for a user")
+        .addUserOption((option) =>
+          option
+            .setName("user")
+            .setDescription("User to check")
+            .setRequired(true),
+        ),
     ].map((command) => command.toJSON());
 
     const rest = new REST({ version: "10" }).setToken(
@@ -1388,133 +1197,238 @@ client.once("ready", async () => {
 
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== "promote") return;
+  const cmd = interaction.commandName;
 
-  const member = interaction.member;
+  if (cmd === "promote") {
+    await interaction.deferReply();
+    const member = interaction.member;
 
-  const hasRole = member.roles.cache.some(
-    (role) => role.name === APPROVER_ROLE_NAME,
-  );
+    const hasRole = member.roles.cache.some(
+      (role) => role.name === APPROVER_ROLE_NAME,
+    );
 
-  if (!hasRole) {
-    return interaction.reply({
-      content: "❌ You do not have permission to use this command.",
-      ephemeral: true,
+    if (!hasRole) {
+      return interaction.reply({
+        content: "❌ You do not have permission to use this command.",
+        ephemeral: true,
+      });
+    }
+
+    const users = [
+      interaction.options.getUser("user1"),
+      interaction.options.getUser("user2"),
+      interaction.options.getUser("user3"),
+    ].filter(Boolean);
+
+    const results = [];
+
+    const botMember = await interaction.guild.members.fetchMe();
+
+    for (const user of users) {
+      try {
+        const targetMember = await interaction.guild.members.fetch(user.id);
+
+        const nickname = targetMember.nickname || targetMember.user.username;
+
+        const rankMatch = nickname.match(/\[(OR-\d+)\]/i);
+
+        if (!rankMatch) {
+          results.push(`${user} - ❌ Rank tag not found`);
+          continue;
+        }
+
+        const currentTag = rankMatch[1];
+        const currentRank = rankHierarchy.find((r) => r.tag === currentTag);
+
+        if (!currentRank) {
+          results.push(`${user} - ❌ Rank not configured`);
+          continue;
+        }
+
+        const oldRole = interaction.guild.roles.cache.get(currentRank.roleId);
+        const newRole = interaction.guild.roles.cache.get(
+          currentRank.nextRoleId,
+        );
+
+        if (!newRole) {
+          results.push(`${user} - ❌ Next rank role not found`);
+          continue;
+        }
+
+        console.log("========== PROMOTION DEBUG ==========");
+        console.log("Target:", targetMember.user.tag);
+        console.log("Bot:", botMember.user.tag);
+        console.log("Bot Position:", botMember.roles.highest.position);
+        console.log("Target Position:", targetMember.roles.highest.position);
+        console.log("Old Role:", oldRole?.name, oldRole?.position);
+        console.log("New Role:", newRole.name, newRole.position);
+        console.log("====================================");
+
+        // =========================
+        // REMOVE OLD ROLE (SAFE)
+        // =========================
+        try {
+          if (oldRole && targetMember.roles.cache.has(oldRole.id)) {
+            if (oldRole.position >= botMember.roles.highest.position) {
+              results.push(`${user} - ⚠️ Cannot remove old role (hierarchy)`);
+            } else {
+              await targetMember.roles.remove(oldRole);
+              await new Promise((r) => setTimeout(r, 500));
+            }
+          }
+        } catch (err) {
+          console.log("REMOVE ERROR:", err);
+          results.push(`${user} - ⚠️ Failed to remove old role`);
+          continue;
+        }
+
+        // REFRESH MEMBER AFTER ROLE CHANGE
+        const refreshedMember = await interaction.guild.members.fetch(user.id);
+
+        // =========================
+        // ADD NEW ROLE (SAFE)
+        // =========================
+        try {
+          if (newRole.position >= botMember.roles.highest.position) {
+            results.push(`${user} - ❌ Cannot assign new role (hierarchy)`);
+            continue;
+          }
+
+          await refreshedMember.roles.add(newRole);
+        } catch (err) {
+          console.log("ADD ERROR:", err);
+          results.push(`${user} - ❌ Failed to add new role`);
+          continue;
+        }
+
+        // =========================
+        // UPDATE NICKNAME
+        // =========================
+        try {
+          const newNickname = nickname.replace(
+            `[${currentRank.tag}]`,
+            `[${currentRank.nextTag}]`,
+          );
+
+          await refreshedMember.setNickname(newNickname);
+        } catch (err) {
+          console.log("NICKNAME ERROR:", err);
+        }
+
+        // =========================
+        // SYNC TO SHEETS: update rank and designation
+        // =========================
+        try {
+          // derive rank label from nextRoleName (string like "[OR-2] | Private First Class")
+          const nextRoleName = currentRank.nextRoleName || "";
+          let rankLabel = nextRoleName.split("|").pop().trim();
+          const rankDesignation = currentRank.nextTag || "";
+
+          // convert full rank label to abbreviation when possible
+          if (RANK_ABBREV[rankLabel]) {
+            rankLabel = RANK_ABBREV[rankLabel];
+          }
+
+          try {
+            await sheetHelper.setPromotion(
+              // callsign from nickname parts
+              (nickname.split("|")[1] || nickname).trim(),
+              rankLabel,
+              rankDesignation,
+              promotionRanks,
+            );
+          } catch (err) {
+            console.log("SHEET SYNC ERROR:", err);
+          }
+        } catch (err) {
+          console.log("SHEET SYNC ERROR:", err);
+        }
+
+        results.push(`${user} - Promoted to ${currentRank.nextRoleName}`);
+      } catch (err) {
+        console.error(err);
+        results.push(`${user} - ❌ Promotion failed`);
+      }
+    }
+
+    await interaction.editReply({
+      content:
+        `# <:PUAF:1504174549451800677> Personnel Promotions <:PUAF:1504174549451800677>\n\n` +
+        results.join("\n\n") +
+        `\n\n### Congratulations 🎉`,
     });
+    return;
   }
 
-  const users = [
-    interaction.options.getUser("user1"),
-    interaction.options.getUser("user2"),
-    interaction.options.getUser("user3"),
-  ].filter(Boolean);
+  if (cmd === "checkpoints") {
+    await interaction.deferReply();
 
-  const results = [];
+    const user = interaction.options.getUser("user");
 
-  const botMember = await interaction.guild.members.fetchMe();
+    if (!user) {
+      return interaction.editReply({ content: "❌ No user provided." });
+    }
 
-  for (const user of users) {
     try {
       const targetMember = await interaction.guild.members.fetch(user.id);
 
       const nickname = targetMember.nickname || targetMember.user.username;
 
+      const parts = nickname.split("|").map((p) => p.trim());
+
+      const callsign = parts.length >= 2 ? parts[1] : null;
+
+      if (!callsign) {
+        return interaction.editReply({
+          content: `❌ Callsign not found in nickname for <@${user.id}>`,
+        });
+      }
+
+      const result = await getPoints(callsign);
+
+      if (!result.success) {
+        return interaction.editReply({ content: `❌ ${result.error}` });
+      }
+
+      // Rank from nickname
       const rankMatch = nickname.match(/\[(OR-\d+)\]/i);
+      const currentTag = rankMatch ? rankMatch[1] : null;
+      const currentRank = currentTag
+        ? rankHierarchy.find((r) => r.tag === currentTag)
+        : null;
 
-      if (!rankMatch) {
-        results.push(`${user} - ❌ Rank tag not found`);
-        continue;
-      }
+      const rankDisplay = currentRank
+        ? `${currentRank.tag} | ${currentRank.roleName.split("|").pop().trim()}`
+        : "Unknown";
 
-      const currentTag = rankMatch[1];
-      const currentRank = rankHierarchy.find((r) => r.tag === currentTag);
+      // Regiment from sheet name
+      const regiment = result.sheet || "Unknown";
 
-      if (!currentRank) {
-        results.push(`${user} - ❌ Rank not configured`);
-        continue;
-      }
+      // Promotion calculation
+      const nextPromo = promotionRanks.find((p) => p.points > result.points);
+      const promoText = nextPromo
+        ? `${nextPromo.points - result.points} points remaining to ${nextPromo.rank}`
+        : "No further promotions configured";
 
-      const oldRole = interaction.guild.roles.cache.get(currentRank.roleId);
-      const newRole = interaction.guild.roles.cache.get(currentRank.nextRoleId);
+      const embed = new EmbedBuilder()
+        .setTitle("Points Check")
+        .setDescription(
+          `<@${user.id}>\n\n` +
+            `**Callsign:** ${callsign}\n` +
+            `**Rank:** ${rankDisplay}\n` +
+            `**Regiment:** ${regiment}\n` +
+            `**Points:** ${result.points}\n` +
+            `**For Promotion:** ${promoText}`,
+        )
+        .setColor("Blue")
+        .setTimestamp();
 
-      if (!newRole) {
-        results.push(`${user} - ❌ Next rank role not found`);
-        continue;
-      }
-
-      console.log("========== PROMOTION DEBUG ==========");
-      console.log("Target:", targetMember.user.tag);
-      console.log("Bot:", botMember.user.tag);
-      console.log("Bot Position:", botMember.roles.highest.position);
-      console.log("Target Position:", targetMember.roles.highest.position);
-      console.log("Old Role:", oldRole?.name, oldRole?.position);
-      console.log("New Role:", newRole.name, newRole.position);
-      console.log("====================================");
-
-      // =========================
-      // REMOVE OLD ROLE (SAFE)
-      // =========================
-      try {
-        if (oldRole && targetMember.roles.cache.has(oldRole.id)) {
-          if (oldRole.position >= botMember.roles.highest.position) {
-            results.push(`${user} - ⚠️ Cannot remove old role (hierarchy)`);
-          } else {
-            await targetMember.roles.remove(oldRole);
-            await new Promise((r) => setTimeout(r, 500));
-          }
-        }
-      } catch (err) {
-        console.log("REMOVE ERROR:", err);
-        results.push(`${user} - ⚠️ Failed to remove old role`);
-        continue;
-      }
-
-      // REFRESH MEMBER AFTER ROLE CHANGE
-      const refreshedMember = await interaction.guild.members.fetch(user.id);
-
-      // =========================
-      // ADD NEW ROLE (SAFE)
-      // =========================
-      try {
-        if (newRole.position >= botMember.roles.highest.position) {
-          results.push(`${user} - ❌ Cannot assign new role (hierarchy)`);
-          continue;
-        }
-
-        await refreshedMember.roles.add(newRole);
-      } catch (err) {
-        console.log("ADD ERROR:", err);
-        results.push(`${user} - ❌ Failed to add new role`);
-        continue;
-      }
-
-      // =========================
-      // UPDATE NICKNAME
-      // =========================
-      try {
-        const newNickname = nickname.replace(
-          `[${currentRank.tag}]`,
-          `[${currentRank.nextTag}]`,
-        );
-
-        await refreshedMember.setNickname(newNickname);
-      } catch (err) {
-        console.log("NICKNAME ERROR:", err);
-      }
-
-      results.push(`${user} - Promoted to ${currentRank.nextRoleName}`);
+      return interaction.editReply({ embeds: [embed] });
     } catch (err) {
       console.error(err);
-      results.push(`${user} - ❌ Promotion failed`);
+      return interaction.editReply({ content: "❌ Error fetching points." });
     }
   }
-
-  await interaction.reply({
-    content:
-      `# <:PUAF:1504174549451800677> Personnel Promotions <:PUAF:1504174549451800677>\n\n` +
-      results.join("\n\n") +
-      `\n\n### Congratulations 🎉`,
-  });
 });
 
 // =========================
